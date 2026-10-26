@@ -1,0 +1,155 @@
+//
+//  Globals.swift
+//  Accord
+//
+//  Created by evelyn on 2022-06-18.
+//
+
+import SwiftUI
+import Combine
+
+enum GenericErrors: Error {
+    case noConnection
+    case badGateway
+}
+
+enum Storage {
+    
+    public static var emotes = [String: [DiscordEmote]]()
+    
+    // these should be merged ideally
+    public static var roleColors = [String: (Int, Int)]()
+    public static var roleNames = [String: String]()
+    
+    public static var mergedMembers = [String: Guild.MergedMember]()
+    
+    public static var users = [String:User]()
+
+    @MainActor
+    public static var usernames: [String: String] {
+        self.users.mapValues { $0.username }
+    }
+    
+    public static var globals: AppGlobals? = nil
+}
+
+final class AppGlobals: ObservableObject {
+    
+    init() {
+        self.connect()
+    }
+    
+    func connect() {
+        Storage.globals = self
+        self.cancellable = Self.newItemPublisher.sink { [weak self] channel, folder in
+            if let channel {
+                DispatchQueue.main.async {
+                    self?.privateChannels.append(channel)
+                    Storage.globals = self
+                }
+            } else if let folder {
+                if let id = folder.guild_ids.first, self?.folders.map(\.guild_ids).joined().contains(id) == false {
+                    DispatchQueue.main.async {
+                        self?.folders.append(folder)
+                        Storage.globals = self
+                    }
+                }
+            }
+        }
+    }
+        
+    var cancellable: AnyCancellable?
+    
+    @Published
+    public var folders = [GuildFolder]()
+    
+    @MainActor @Published
+    public var privateChannels = [Channel]()
+    
+    @MainActor @Published
+    var selectedChannel: Channel? = nil
+    
+    @MainActor @Published
+    var selectedGuild: Guild? = nil
+    
+    @MainActor
+    var listCache: [String:[OPSItems]] = [:]
+    
+    @MainActor @Published
+    public var discordSettings: DiscordSettings = .init()
+    
+    @MainActor @Published
+    public var userGuildSettings: UserGuildSettings = .init()
+    
+    @AppStorage("HideMutedChannels")
+    var hideMutedChannels: Bool = false
+    
+    @Published
+    public var token: String? = {
+        let tokenData = KeychainManager.load(key: keychainItemName)
+        if let tokenData, let token = String(data: tokenData, encoding: .utf8), AppGlobals.validateToken(token) {
+            return token
+        } else {
+            return nil
+        }
+    }()
+    
+    static func validateToken(_ token: String) -> Bool {
+        let token = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        let components = token.components(separatedBy: ".")
+        guard components.count >= 3, var id = components.first, !id.isEmpty else { return false }
+        // Discord strips the base64 padding and may use the URL-safe alphabet.
+        // Newer (19-digit) user IDs need "==" padding, otherwise Data(base64Encoded:) returns nil
+        // and the token was rejected — which made the gateway close before READY.
+        id = id.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while id.count % 4 != 0 { id += "=" }
+        if let decoded = Data(base64Encoded: id),
+           let result = String(data: decoded, encoding: .utf8),
+           UInt64(result) != nil {
+            return true
+        }
+        return false
+    }
+    
+    static var newItemPublisher = PassthroughSubject<(Channel?, GuildFolder?), Never>()
+    
+    @MainActor
+    func permissionsAllowed(_ perms: [Channel.PermissionOverwrites], guildID: String) -> Permissions {
+        var permsArray = Permissions(
+            folders.lazy
+                .map(\.guilds)
+                .joined()
+                .filter { $0.id == guildID }
+                .first?.roles?.lazy
+                .compactMap { (role) -> Permissions? in
+                    guard Storage.mergedMembers[guildID]?.roles.contains(role.id) == true,
+                          let perms = role.permissions,
+                          let num = Int64(perms) else { return nil }
+                    return Permissions(num)
+                } ?? [Permissions]()
+        )
+
+        if permsArray.contains(.administrator) {
+            permsArray = Permissions.all
+            return permsArray
+        }
+
+        let everyonePerms = perms.filter { $0.id == guildID }
+        permsArray.insert(.init([
+            .sendMessages, .readMessages, .changeNickname, .addReactions
+        ]))
+        permsArray.remove(Permissions(everyonePerms.map(\.deny)))
+        permsArray.insert(Permissions(everyonePerms.map(\.allow)))
+        let rolePerms = perms.filter { Storage.mergedMembers[guildID]?.roles.contains($0.id) ?? false }
+        permsArray.remove(Permissions(rolePerms.map(\.deny)))
+        permsArray.insert(Permissions(rolePerms.map(\.allow)))
+        let memberPerms = perms.filter { $0.id == Globals.user?.id }
+        permsArray.remove(Permissions(memberPerms.map(\.deny)))
+        permsArray.insert(Permissions(memberPerms.map(\.allow)))
+        return permsArray
+    }
+
+}
+
+let smallOperationQueue = DispatchQueue.global(qos: .background)
+let userOperationQueue = DispatchQueue.global(qos: .userInteractive)
